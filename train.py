@@ -9,6 +9,7 @@ import os
 import time
 import numpy as np
 import tensorflow as tf
+import horovod.tensorflow as hvd
 
 import config
 import tfutil
@@ -117,7 +118,7 @@ class TrainingSchedule:
 
         # Minibatch size.
         self.minibatch = minibatch_dict.get(self.resolution, minibatch_base)
-        self.minibatch -= self.minibatch % config.num_gpus
+        self.minibatch -= self.minibatch % (config.num_gpus * hvd.size())
         if self.resolution in max_minibatch_per_gpu:
             self.minibatch = min(self.minibatch, max_minibatch_per_gpu[self.resolution] * config.num_gpus)
 
@@ -169,42 +170,50 @@ def train_progressive_gan(
         lod_in          = tf.placeholder(tf.float32, name='lod_in', shape=[])
         lrate_in        = tf.placeholder(tf.float32, name='lrate_in', shape=[])
         minibatch_in    = tf.placeholder(tf.int32, name='minibatch_in', shape=[])
-        minibatch_split = minibatch_in // config.num_gpus
+        minibatch_split = minibatch_in // (config.num_gpus * hvd.size())
         reals, labels   = training_set.get_minibatch_tf()
-        reals_split     = tf.split(reals, config.num_gpus)
-        labels_split    = tf.split(labels, config.num_gpus)
+        reals_split     = tf.split(reals, config.num_gpus * hvd.size())
+        labels_split    = tf.split(labels, config.num_gpus * hvd.size())
     G_opt = tfutil.Optimizer(name='TrainG', learning_rate=lrate_in, **config.G_opt)
     D_opt = tfutil.Optimizer(name='TrainD', learning_rate=lrate_in, **config.D_opt)
+    # TODO: Fix Horovod (hvd) DistributedOptimizer
+    #G_opt = hvd.DistributedOptimizer(G_opt)
+    #D_opt = hvd.DistributedOptimizer(D_opt)
     for gpu in range(config.num_gpus):
+        hvdgpu = hvd.rank() * config.num_gpus + gpu
         with tf.name_scope('GPU%d' % gpu), tf.device('/gpu:%d' % gpu):
             G_gpu = G if gpu == 0 else G.clone(G.name + '_shadow')
             D_gpu = D if gpu == 0 else D.clone(D.name + '_shadow')
             lod_assign_ops = [tf.assign(G_gpu.find_var('lod'), lod_in), tf.assign(D_gpu.find_var('lod'), lod_in)]
-            reals_gpu = process_reals(reals_split[gpu], lod_in, mirror_augment, training_set.dynamic_range, drange_net)
-            labels_gpu = labels_split[gpu]
+            reals_gpu = process_reals(reals_split[hvdgpu], lod_in, mirror_augment, training_set.dynamic_range, drange_net)
+            labels_gpu = labels_split[hvdgpu]
             with tf.name_scope('G_loss'), tf.control_dependencies(lod_assign_ops):
                 G_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=G_opt, training_set=training_set, minibatch_size=minibatch_split, **config.G_loss)
             with tf.name_scope('D_loss'), tf.control_dependencies(lod_assign_ops):
                 D_loss = tfutil.call_func_by_name(G=G_gpu, D=D_gpu, opt=D_opt, training_set=training_set, minibatch_size=minibatch_split, reals=reals_gpu, labels=labels_gpu, **config.D_loss)
+            # TODO: Fix Horovod (hvd) DistributedOptimizer
             G_opt.register_gradients(tf.reduce_mean(G_loss), G_gpu.trainables)
             D_opt.register_gradients(tf.reduce_mean(D_loss), D_gpu.trainables)
+    # TODO: Fix Horovod (hvd) DistributedOptimizer
     G_train_op = G_opt.apply_updates()
     D_train_op = D_opt.apply_updates()
+
 
     print('Setting up snapshot image grid...')
     grid_size, grid_reals, grid_labels, grid_latents = setup_snapshot_image_grid(G, training_set, **config.grid)
     sched = TrainingSchedule(total_kimg * 1000, training_set, **config.sched)
-    grid_fakes = Gs.run(grid_latents, grid_labels, minibatch_size=sched.minibatch//config.num_gpus)
+    grid_fakes = Gs.run(grid_latents, grid_labels, minibatch_size=sched.minibatch//(config.num_gpus * hvd.size()))
 
-    print('Setting up result dir...')
-    result_subdir = misc.create_result_subdir(config.result_dir, config.desc)
-    misc.save_image_grid(grid_reals, os.path.join(result_subdir, 'reals.png'), drange=training_set.dynamic_range, grid_size=grid_size)
-    misc.save_image_grid(grid_fakes, os.path.join(result_subdir, 'fakes%06d.png' % 0), drange=drange_net, grid_size=grid_size)
-    summary_log = tf.summary.FileWriter(result_subdir)
-    if save_tf_graph:
-        summary_log.add_graph(tf.get_default_graph())
-    if save_weight_histograms:
-        G.setup_weight_histograms(); D.setup_weight_histograms()
+    if hvd.rank() == 0:
+        print('Setting up result dir...')
+        result_subdir = misc.create_result_subdir(config.result_dir, config.desc)
+        misc.save_image_grid(grid_reals, os.path.join(result_subdir, 'reals.png'), drange=training_set.dynamic_range, grid_size=grid_size)
+        misc.save_image_grid(grid_fakes, os.path.join(result_subdir, 'fakes%06d.png' % 0), drange=drange_net, grid_size=grid_size)
+        summary_log = tf.summary.FileWriter(result_subdir)
+        if save_tf_graph:
+            summary_log.add_graph(tf.get_default_graph())
+        if save_weight_histograms:
+            G.setup_weight_histograms(); D.setup_weight_histograms()
 
     print('Training...')
     cur_nimg = int(resume_kimg * 1000)
@@ -220,6 +229,7 @@ def train_progressive_gan(
         training_set.configure(sched.minibatch, sched.lod)
         if reset_opt_for_new_lod:
             if np.floor(sched.lod) != np.floor(prev_lod) or np.ceil(sched.lod) != np.ceil(prev_lod):
+                # TODO: Fix Horovod (hvd) DistributedOptimizer
                 G_opt.reset_optimizer_state(); D_opt.reset_optimizer_state()
         prev_lod = sched.lod
 
@@ -243,39 +253,45 @@ def train_progressive_gan(
             maintenance_start_time = cur_time
 
             # Report progress.
-            print('tick %-5d kimg %-8.1f lod %-5.2f minibatch %-4d time %-12s sec/tick %-7.1f sec/kimg %-7.2f maintenance %.1f' % (
-                tfutil.autosummary('Progress/tick', cur_tick),
-                tfutil.autosummary('Progress/kimg', cur_nimg / 1000.0),
-                tfutil.autosummary('Progress/lod', sched.lod),
-                tfutil.autosummary('Progress/minibatch', sched.minibatch),
-                misc.format_time(tfutil.autosummary('Timing/total_sec', total_time)),
-                tfutil.autosummary('Timing/sec_per_tick', tick_time),
-                tfutil.autosummary('Timing/sec_per_kimg', tick_time / tick_kimg),
-                tfutil.autosummary('Timing/maintenance_sec', maintenance_time)))
-            tfutil.autosummary('Timing/total_hours', total_time / (60.0 * 60.0))
-            tfutil.autosummary('Timing/total_days', total_time / (24.0 * 60.0 * 60.0))
-            tfutil.save_summaries(summary_log, cur_nimg)
+            if hvd.rank() == 0:
+                print('tick %-5d kimg %-8.1f lod %-5.2f minibatch %-4d time %-12s sec/tick %-7.1f sec/kimg %-7.2f maintenance %.1f' % (
+                    tfutil.autosummary('Progress/tick', cur_tick),
+                    tfutil.autosummary('Progress/kimg', cur_nimg / 1000.0),
+                    tfutil.autosummary('Progress/lod', sched.lod),
+                    tfutil.autosummary('Progress/minibatch', sched.minibatch),
+                    misc.format_time(tfutil.autosummary('Timing/total_sec', total_time)),
+                    tfutil.autosummary('Timing/sec_per_tick', tick_time),
+                    tfutil.autosummary('Timing/sec_per_kimg', tick_time / tick_kimg),
+                    tfutil.autosummary('Timing/maintenance_sec', maintenance_time)))
+                tfutil.autosummary('Timing/total_hours', total_time / (60.0 * 60.0))
+                tfutil.autosummary('Timing/total_days', total_time / (24.0 * 60.0 * 60.0))
+                tfutil.save_summaries(summary_log, cur_nimg)
 
             # Save snapshots.
             if cur_tick % image_snapshot_ticks == 0 or done:
-                grid_fakes = Gs.run(grid_latents, grid_labels, minibatch_size=sched.minibatch//config.num_gpus)
-                misc.save_image_grid(grid_fakes, os.path.join(result_subdir, 'fakes%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size)
+                grid_fakes = Gs.run(grid_latents, grid_labels, minibatch_size=sched.minibatch//(config.num_gpus * hvd.size()))
+                if hvd.rank() == 0:
+                    misc.save_image_grid(grid_fakes, os.path.join(result_subdir, 'fakes%06d.png' % (cur_nimg // 1000)), drange=drange_net, grid_size=grid_size)
             if cur_tick % network_snapshot_ticks == 0 or done:
-                misc.save_pkl((G, D, Gs), os.path.join(result_subdir, 'network-snapshot-%06d.pkl' % (cur_nimg // 1000)))
+                if hvd.rank() == 0:
+                    misc.save_pkl((G, D, Gs), os.path.join(result_subdir, 'network-snapshot-%06d.pkl' % (cur_nimg // 1000)))
 
             # Record start time of the next tick.
             tick_start_time = time.time()
 
     # Write final results.
-    misc.save_pkl((G, D, Gs), os.path.join(result_subdir, 'network-final.pkl'))
-    summary_log.close()
-    open(os.path.join(result_subdir, '_training-done.txt'), 'wt').close()
+    if hvd.rank() == 0:
+        misc.save_pkl((G, D, Gs), os.path.join(result_subdir, 'network-final.pkl'))
+        summary_log.close()
+        open(os.path.join(result_subdir, '_training-done.txt'), 'wt').close()
 
 #----------------------------------------------------------------------------
 # Main entry point.
 # Calls the function indicated in config.py.
 
 if __name__ == "__main__":
+    # Initialize Horovod
+    hvd.init()
     misc.init_output_logging()
     np.random.seed(config.random_seed)
     print('Initializing TensorFlow...')

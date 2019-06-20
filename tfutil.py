@@ -13,6 +13,7 @@ import imp
 import numpy as np
 from collections import OrderedDict
 import tensorflow as tf
+import horovod.tensorflow as hvd
 
 #----------------------------------------------------------------------------
 # Convenience.
@@ -62,7 +63,9 @@ def init_tf(config_dict=dict()):
 # {'gpu_options.allow_growth': True}
 
 def create_session(config_dict=dict(), force_as_default=False):
-    config = tf.ConfigProto()
+    # TODO: Fix Horovod (hvd) GPU Config -- handle multiple nodes
+    config = tf.ConfigProto(allow_soft_placement=True)
+    config.gpu_options.visible_device_list = str(hvd.local_rank())
     for key, value in config_dict.items():
         fields = key.split('.')
         obj = config
@@ -96,6 +99,12 @@ def init_uninited_vars(vars=None):
                     test_ops.append(tf.is_variable_initialized(var))
     init_vars = [var for var, inited in zip(test_vars, run(test_ops)) if not inited]
     run([var.initializer for var in init_vars])
+    # TODO: Fix Horovod (hvd) Broadcast -- Called by summaries (root node only operations)
+    #if broadcast:
+    #  print("INIT_UNINITED_VARS broadcasting", vars)
+    #  hvd.broadcast_variables(vars, 0).run()
+    #else:
+    #  print("INIT_UNINITED_VARS no broadcast", vars)
 
 #----------------------------------------------------------------------------
 # Set the values of given tf.Variables.
@@ -293,7 +302,8 @@ class Optimizer:
         with tf.name_scope(self.id + '_grad'), tf.device(dev):
             if dev not in self._dev_opt:
                 opt_name = self.scope.replace('/', '_') + '_opt%d' % len(self._dev_opt)
-                self._dev_opt[dev] = self.optimizer_class(name=opt_name, learning_rate=self.learning_rate, **self.optimizer_kwargs)
+                # TODO: Fix Horovod (hvd) DistributedOptimizer
+                self._dev_opt[dev] = hvd.DistributedOptimizer(self.optimizer_class(name=opt_name, learning_rate=self.learning_rate, **self.optimizer_kwargs))
                 self._dev_grads[dev] = []
             loss = self.apply_loss_scaling(tf.cast(loss, tf.float32))
             grads = self._dev_opt[dev].compute_gradients(loss, vars, gate_gradients=tf.train.Optimizer.GATE_NONE) # disable gating to reduce memory usage
@@ -359,7 +369,7 @@ class Optimizer:
                                 lambda: tf.group(tf.assign_sub(ls_var, self.loss_scaling_dec))))
 
                     # Report statistics on the last device.
-                    if dev == devices[-1]:
+                    if dev == devices[-1] and hvd.rank() == 0:
                         with tf.name_scope('Statistics'):
                             ops.append(autosummary(self.id + '/learning_rate', self.learning_rate))
                             ops.append(autosummary(self.id + '/overflow_frequency', tf.where(grad_ok, 0, 1)))
@@ -369,11 +379,16 @@ class Optimizer:
             # Initialize variables and group everything into a single op.
             self.reset_optimizer_state()
             init_uninited_vars(list(self._dev_ls_var.values()))
+            # TODO: Fix Horovod (hvd) DistributedOptimizer
+            hvd.broadcast_variables(list(self._dev_ls_var.values()), 0).run()
             return tf.group(*ops, name='TrainingOp')
 
     # Reset internal state of the underlying optimizer.
     def reset_optimizer_state(self):
         run([var.initializer for opt in self._dev_opt.values() for var in opt.variables()])
+        # TODO: Fix Horovod (hvd) DistributedOptimizer
+        hvd.broadcast_variables([var for opt in self._dev_opt.values() for var in opt.variables()], 0).run()
+
 
     # Get or create variable representing log2 of the current dynamic loss scaling factor.
     def get_loss_scaling_var(self, device):
@@ -493,10 +508,16 @@ class Network:
     # Run initializers for all variables defined by this network.
     def reset_vars(self):
         run([var.initializer for var in self.vars.values()])
+        # TODO: Fix Horovod (hvd) Broadcast
+        #print("RESET_VARS", self.vars.values())
+        hvd.broadcast_variables(self.vars.values(), 0).run()
+
 
     # Run initializers for all trainable variables defined by this network.
     def reset_trainables(self):
         run([var.initializer for var in self.trainables.values()])
+        # TODO: Fix Horovod (hvd) Broadcast - Not Used
+        hvd.broadcast_variables(self.trainables.values(), 0).run()
 
     # Get TensorFlow expression(s) for the output(s) of this network, given the inputs.
     def get_output_for(self, *in_expr, return_as_list=False, **dynamic_kwargs):

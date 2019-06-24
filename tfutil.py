@@ -63,9 +63,18 @@ def init_tf(config_dict=dict()):
 # {'gpu_options.allow_growth': True}
 
 def create_session(config_dict=dict(), force_as_default=False):
-    # TODO: Fix Horovod (hvd) GPU Config -- handle multiple nodes
     config = tf.ConfigProto(allow_soft_placement=True)
-    config.gpu_options.visible_device_list = str(hvd.local_rank())
+    visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if not visible_devices:
+      visible_devices = str(hvd.local_rank())
+    else:
+      visible_devices = visible_devices.split(',')
+      num_gpus = len(visible_devices) // hvd.local_size()
+      start_gpu = hvd.local_rank() * num_gpus
+      visible_devices = ','.join(visible_devices[start_gpu:start_gpu + num_gpus])
+    # TODO: Verify invariant expectation - need num_gpus from import config as cfg
+    #assert cfg.num_gpus == len(visible_devices.split(','))
+    config.gpu_options.visible_device_list = visible_devices
     for key, value in config_dict.items():
         fields = key.split('.')
         obj = config
